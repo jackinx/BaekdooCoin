@@ -1,0 +1,18 @@
+{
+  "KRW-XRP": {
+    "entry_price": 1972.0,
+    "last_buy_price": 1938.0,
+    "atr": 39.44,
+    "stage": 2,
+    "fire_count": 0,
+    "highest_price": 1972.0,
+    "bone_armed": false,
+    "carve_levels": [],
+    "last_carve_peak": 0.0,
+    "_carves_triggered": 0,
+    "was_10pct_profit": false,
+    "exit_stage": 0,
+    "amount_krw": 9913,
+    "strategy": "manual"
+  }
+}
