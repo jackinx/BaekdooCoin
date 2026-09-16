@@ -1,0 +1,407 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BaekdooCoin — System Architecture</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f8fafc; --fg: #172033; --muted: #5b6475; --line: #94a3b8;
+    --neutral: #e2e8f0; --input: #bfdbfe; --process: #c7d2fe;
+    --storage: #99f6e4; --external: #fde68a; --risk: #fecaca;
+    --green: #bbf7d0; --decision: #fcd34d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f172a; --fg: #e5e7eb; --muted: #a3adbd; --line: #64748b;
+      --neutral: #1e293b; --input: #1e3a5f; --process: #312e81;
+      --storage: #134e4a; --external: #713f12; --risk: #7f1d1d;
+      --green: #14532d; --decision: #713f12;
+    }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  main { max-width: 1020px; margin: 0 auto; padding: 24px 20px; }
+  svg { width: 100%; height: auto; display: block; }
+  h1 { font-size: 22px; font-weight: 700; margin: 32px 0 8px; }
+  h2 { font-size: 17px; font-weight: 650; margin: 40px 0 12px; color: var(--muted); }
+  p.desc { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+  .title { font-size: 18px; font-weight: 700; fill: var(--fg); }
+  .subtitle { font-size: 13px; fill: var(--muted); }
+  .label { font-size: 12px; font-weight: 600; fill: var(--fg); }
+  .small { font-size: 11px; fill: var(--muted); }
+  .tiny { font-size: 10px; fill: var(--muted); }
+  .zone-label { font-size: 11px; font-weight: 600; fill: var(--muted); letter-spacing: 0.5px; text-transform: uppercase; }
+  .node { stroke: var(--line); stroke-width: 1.2; rx: 4; ry: 4; }
+  .node-thick { stroke-width: 1.8; }
+  .ext { fill: var(--external); } .prc { fill: var(--process); } .inp { fill: var(--input); }
+  .sto { fill: var(--storage); } .rsk { fill: var(--risk); } .ntr { fill: var(--neutral); }
+  .grn { fill: var(--green); } .dec { fill: var(--decision); }
+  .edge { stroke: var(--line); stroke-width: 1.3; fill: none; }
+  .edge-dash { stroke-dasharray: 5 4; }
+  .edge-bold { stroke-width: 1.8; stroke: #6366f1; }
+  .edge-green { stroke: #10b981; }
+  .edge-red { stroke: #ef4444; }
+  .zone { fill: none; stroke: var(--line); stroke-width: 1; stroke-dasharray: 6 4; rx: 8; ry: 8; opacity: 0.65; }
+  .zone-fill { fill: var(--neutral); opacity: 0.15; rx: 8; ry: 8; }
+</style>
+<main>
+
+<h1>🪙 BaekdooCoin — System Architecture</h1>
+<p class="desc">Upbit 10대 메이저 코인 완전 자동매매 시스템 · 실시간 WebSocket + 1분 사이클 · 3전략 레짐 기반</p>
+
+<!-- ============================================================ -->
+<!-- DIAGRAM 1: SYSTEM ARCHITECTURE                                -->
+<!-- ============================================================ -->
+<h2>📐 1. Component Architecture &amp; Data Flow</h2>
+
+<svg viewBox="0 0 920 620" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#94a3b8"/></marker>
+    <marker id="arr-b" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#6366f1"/></marker>
+    <marker id="arr-g" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#10b981"/></marker>
+    <marker id="arr-r" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#ef4444"/></marker>
+  </defs>
+
+  <!-- Background zones -->
+  <rect class="zone-fill" x="10" y="40" width="900" height="120"/>
+  <rect class="zone" x="10" y="40" width="900" height="120"/>
+  <text class="zone-label" x="24" y="58">🌐 EXTERNAL</text>
+
+  <rect class="zone-fill" x="10" y="175" width="900" height="120"/>
+  <rect class="zone" x="10" y="175" width="900" height="120"/>
+  <text class="zone-label" x="24" y="193">⚙️ RUNTIME LAYER</text>
+
+  <rect class="zone-fill" x="10" y="310" width="900" height="115"/>
+  <rect class="zone" x="10" y="310" width="900" height="115"/>
+  <text class="zone-label" x="24" y="328">🧠 STRATEGIES &amp; RISK</text>
+
+  <rect class="zone-fill" x="10" y="440" width="900" height="95"/>
+  <rect class="zone" x="10" y="440" width="900" height="95"/>
+  <text class="zone-label" x="24" y="458">💾 DATA LAYER</text>
+
+  <!-- EXTERNAL ZONE -->
+  <rect class="node ext node-thick" x="50" y="75" width="155" height="52"/>
+  <text class="label" x="127" y="98" text-anchor="middle">⬆️ Upbit Exchange</text>
+  <text class="small" x="127" y="116" text-anchor="middle">REST · WebSocket</text>
+
+  <rect class="node ext" x="380" y="75" width="130" height="52"/>
+  <text class="label" x="445" y="98" text-anchor="middle">📱 Telegram</text>
+  <text class="small" x="445" y="116" text-anchor="middle">Bot API</text>
+
+  <rect class="node ext" x="630" y="75" width="120" height="52"/>
+  <text class="label" x="690" y="98" text-anchor="middle">🤖 OpenClaw</text>
+  <text class="small" x="690" y="116" text-anchor="middle">Relay · Cron</text>
+
+  <!-- RUNTIME ZONE -->
+  <rect class="node prc node-thick" x="40" y="210" width="160" height="55"/>
+  <text class="label" x="120" y="233" text-anchor="middle">🎮 Live Monitor</text>
+  <text class="small" x="120" y="251" text-anchor="middle">WebSocket · 1분 사이클</text>
+
+  <rect class="node prc node-thick" x="280" y="210" width="180" height="55"/>
+  <text class="label" x="370" y="233" text-anchor="middle">🧠 MTF Engine</text>
+  <text class="small" x="370" y="251" text-anchor="middle">1D+5M Dual Sleeve</text>
+
+  <rect class="node prc" x="540" y="210" width="145" height="55"/>
+  <text class="label" x="612" y="233" text-anchor="middle">🔌 Upbit Client</text>
+  <text class="small" x="612" y="251" text-anchor="middle">REST · JWT 인증</text>
+
+  <rect class="node prc" x="740" y="210" width="140" height="55"/>
+  <text class="label" x="810" y="233" text-anchor="middle">📡 Telegram Ctrl</text>
+  <text class="small" x="810" y="251" text-anchor="middle">/stop · /status</text>
+
+  <!-- STRATEGIES ZONE -->
+  <rect class="node inp" x="20" y="345" width="130" height="50"/>
+  <text class="label" x="85" y="365" text-anchor="middle">🌡️ Regime Detector</text>
+  <text class="small" x="85" y="382" text-anchor="middle">ADX · BB · EMA</text>
+
+  <rect class="node inp" x="185" y="345" width="115" height="50"/>
+  <text class="label" x="242" y="365" text-anchor="middle">🐢 Turtle MTF</text>
+  <text class="small" x="242" y="382" text-anchor="middle">55D Donchian</text>
+
+  <rect class="node inp" x="335" y="345" width="115" height="50"/>
+  <text class="label" x="392" y="365" text-anchor="middle">🌀 Squeeze</text>
+  <text class="small" x="392" y="382" text-anchor="middle">LazyBear</text>
+
+  <rect class="node inp" x="485" y="345" width="115" height="50"/>
+  <text class="label" x="542" y="365" text-anchor="middle">🔄 BB+RSI</text>
+  <text class="small" x="542" y="382" text-anchor="middle">Mean Reversion</text>
+
+  <rect class="node rsk" x="660" y="345" width="115" height="50"/>
+  <text class="label" x="717" y="365" text-anchor="middle">🛡️ Risk MTF</text>
+  <text class="small" x="717" y="382" text-anchor="middle">Portfolio Cap</text>
+
+  <rect class="node rsk" x="820" y="345" width="55" height="50"/>
+  <text class="label" x="847" y="367" text-anchor="middle">CTP</text>
+  <text class="small" x="847" y="384" text-anchor="middle">v3</text>
+
+  <!-- DATA ZONE -->
+  <rect class="node sto" x="40" y="468" width="135" height="48"/>
+  <text class="label" x="107" y="488" text-anchor="middle">📥 Data Crawler</text>
+  <text class="small" x="107" y="504" text-anchor="middle">1D·4H·1H OHLCV</text>
+
+  <rect class="node sto node-thick" x="280" y="468" width="160" height="48"/>
+  <text class="label" x="360" y="488" text-anchor="middle">🗄️ SQLite DB</text>
+  <text class="small" x="360" y="504" text-anchor="middle">upbit_v2.db (1.1GB)</text>
+
+  <rect class="node sto" x="540" y="468" width="135" height="48"/>
+  <text class="label" x="607" y="488" text-anchor="middle">📋 Positions</text>
+  <text class="small" x="607" y="504" text-anchor="middle">JSON · CTP 상태</text>
+
+  <rect class="node ntr" x="740" y="468" width="135" height="48"/>
+  <text class="label" x="807" y="488" text-anchor="middle">📊 Backtest</text>
+  <text class="small" x="807" y="504" text-anchor="middle">BTC PF 3.53</text>
+
+  <!-- EDGES -->
+  <!-- Upbit → LiveMonitor (WebSocket) -->
+  <path class="edge edge-bold" marker-end="url(#arr-b)" d="M127,127 L127,210"/>
+  <text class="tiny" x="135" y="172">WebSocket</text>
+  <!-- Upbit → UpbitClient (REST) -->
+  <path class="edge" marker-end="url(#arr)" d="M205,100 L612,100 L612,210"/>
+  <text class="tiny" x="450" y="93">REST API</text>
+  <!-- UpbitClient → Upbit (orders) -->
+  <path class="edge" marker-end="url(#arr)" d="M685,210 L685,170 L685,127"/>
+  <text class="tiny" x="693" y="180">Orders</text>
+  <!-- Telegram → TelegramCtrl -->
+  <path class="edge" marker-end="url(#arr)" d="M445,127 L445,170 L810,170 L810,210"/>
+  <text class="tiny" x="630" y="163">Commands</text>
+  <!-- LiveMonitor → MTF Engine -->
+  <path class="edge edge-bold" marker-end="url(#arr-b)" d="M200,237 L280,237"/>
+  <text class="tiny" x="220" y="230">1분 트리거</text>
+  <!-- MTF Engine → RegimeDetector -->
+  <path class="edge" marker-end="url(#arr)" d="M340,265 L340,300 L85,300 L85,345"/>
+  <text class="tiny" x="160" y="293">OHLCV</text>
+  <!-- Regime → Strategies -->
+  <path class="edge edge-green" marker-end="url(#arr-g)" d="M150,370 L185,370"/>
+  <text class="tiny" x="160" y="363">T</text>
+  <path class="edge edge-green" marker-end="url(#arr-g)" d="M85,370 L85,395 L392,395 L392,395"/>
+  <text class="tiny" x="240" y="393">S</text>
+  <path class="edge edge-green" marker-end="url(#arr-g)" d="M85,395 L542,395"/>
+  <text class="tiny" x="320" y="393">R</text>
+  <!-- Strategies → Risk MTF -->
+  <path class="edge edge-red" marker-end="url(#arr-r)" d="M300,380 L300,405 L717,405"/>
+  <path class="edge edge-red" marker-end="url(#arr-r)" d="M450,380 L450,405 L717,405"/>
+  <path class="edge edge-red" marker-end="url(#arr-r)" d="M600,380 L600,405 L717,405"/>
+  <!-- MTF Engine → UpbitClient (orders) -->
+  <path class="edge edge-bold" marker-end="url(#arr-b)" d="M460,250 L612,250 L612,265"/>
+  <text class="tiny" x="525" y="243">주문</text>
+  <!-- Data Crawler → SQLite DB -->
+  <path class="edge edge-green" marker-end="url(#arr-g)" d="M175,492 L280,492"/>
+  <!-- SQLite DB → MTF Engine (reads) -->
+  <path class="edge edge-dash" marker-end="url(#arr)" d="M360,468 L360,440 L365,440 L365,265"/>
+  <!-- Data Crawler → Upbit -->
+  <path class="edge edge-dash" marker-end="url(#arr)" d="M40,492 L20,492 L20,100 L50,100"/>
+</svg>
+
+<!-- ============================================================ -->
+<!-- DIAGRAM 2: TRADING CYCLE FLOWCHART                           -->
+<!-- ============================================================ -->
+<h2>⏱️ 2. 1-Minute Trading Cycle (Decision Loop)</h2>
+
+<svg viewBox="0 0 920 580" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="a2" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#94a3b8"/></marker>
+    <marker id="a2-g" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#10b981"/></marker>
+    <marker id="a2-r" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#ef4444"/></marker>
+  </defs>
+
+  <!-- START -->
+  <rect class="node grn" x="360" y="10" width="180" height="40"/>
+  <text class="label" x="450" y="28" text-anchor="middle">START: 매 분</text>
+  <text class="small" x="450" y="42" text-anchor="middle">WebSocket 가격 수신</text>
+
+  <!-- 1. Emergency Stop -->
+  <rect class="node dec" x="650" y="80" width="180" height="45"/>
+  <text class="label" x="740" y="100" text-anchor="middle">🚨 비상정지 확인</text>
+  <text class="small" x="740" y="118" text-anchor="middle">/tmp/baekdoocoin_emerg*</text>
+
+  <rect class="node rsk" x="650" y="155" width="180" height="40"/>
+  <text class="label" x="740" y="172" text-anchor="middle">🛑 거래 중단 &amp; 종료</text>
+  <text class="tiny" x="740" y="188" text-anchor="middle">Exit cycle</text>
+
+  <!-- 2. Regime Detection -->
+  <rect class="node inp" x="650" y="230" width="180" height="50"/>
+  <text class="label" x="740" y="250" text-anchor="middle">🌡️ 시장 상태 판단</text>
+  <text class="small" x="740" y="268" text-anchor="middle">RegimeDetector</text>
+
+  <!-- Regime branches -->
+  <rect class="node inp" x="270" y="310" width="115" height="45"/>
+  <text class="label" x="327" y="328" text-anchor="middle">🐢 TRENDING</text>
+  <text class="small" x="327" y="346" text-anchor="middle">Turtle MTF</text>
+
+  <rect class="node inp" x="720" y="310" width="115" height="45"/>
+  <text class="label" x="777" y="328" text-anchor="middle">🌀 SQUEEZING</text>
+  <text class="small" x="777" y="346" text-anchor="middle">Squeeze Mom.</text>
+
+  <rect class="node ntr" x="270" y="385" width="115" height="45"/>
+  <text class="label" x="327" y="403" text-anchor="middle">🔄 REVERSING</text>
+  <text class="small" x="327" y="421" text-anchor="middle">BB+RSI</text>
+
+  <rect class="node ntr" x="720" y="385" width="115" height="45"/>
+  <text class="label" x="777" y="403" text-anchor="middle">😴 NEUTRAL</text>
+  <text class="small" x="777" y="421" text-anchor="middle">신규 진입 금지</text>
+
+  <!-- Open positions check -->
+  <rect class="node inp" x="650" y="465" width="180" height="50"/>
+  <text class="label" x="740" y="485" text-anchor="middle">📋 보유 포지션 관리</text>
+  <text class="small" x="740" y="503" text-anchor="middle">손절 / CTP / 물타기 / 불타기</text>
+
+  <!-- New entry filter -->
+  <rect class="node inp" x="360" y="465" width="180" height="50"/>
+  <text class="label" x="450" y="485" text-anchor="middle">🔍 신규 진입 심사</text>
+  <text class="small" x="450" y="503" text-anchor="middle">7종 필터 + 2-TF 돌파 확인</text>
+
+  <!-- Execute -->
+  <rect class="node grn" x="50" y="465" width="180" height="50"/>
+  <text class="label" x="140" y="485" text-anchor="middle">💰 주문 실행</text>
+  <text class="small" x="140" y="503" text-anchor="middle">Upbit REST API</text>
+
+  <!-- Loop back -->
+  <rect class="node prc" x="360" y="540" width="180" height="30"/>
+  <text class="label" x="450" y="558" text-anchor="middle">↻ 다음 사이클까지 대기</text>
+
+  <!-- ===== EDGES ===== -->
+  <!-- Start → Emergency -->
+  <path class="edge" marker-end="url(#a2)" d="M540,30 L590,30 L590,102 L650,102"/>
+  <!-- Emergency → YES (stop) -->
+  <path class="edge edge-red" marker-end="url(#a2-r)" d="M740,125 L740,155"/>
+  <text class="tiny" x="748" y="143">YES</text>
+  <!-- Emergency → NO → Regime -->
+  <path class="edge edge-green" marker-end="url(#a2-g)" d="M830,102 L850,102 L850,255 L830,255"/>
+  <text class="tiny" x="858" y="180">NO</text>
+
+  <!-- Regime → Branches -->
+  <path class="edge" marker-end="url(#a2)" d="M650,255 L600,255 L600,290 L385,290 L385,310"/>
+  <text class="tiny" x="500" y="248">T</text>
+  <path class="edge" marker-end="url(#a2)" d="M720,280 L720,290 L720,310"/>
+  <text class="tiny" x="710" y="298">S</text>
+  <path class="edge" marker-end="url(#a2)" d="M680,265 L327,265 L327,385"/>
+  <text class="tiny" x="500" y="258">R</text>
+  <path class="edge" marker-end="url(#a2)" d="M830,255 L890,255 L890,407 L835,407"/>
+  <text class="tiny" x="898" y="330">N</text>
+
+  <!-- Branches → Actions -->
+  <path class="edge" marker-end="url(#a2)" d="M327,355 L327,425 L450,425 L450,465"/>
+  <path class="edge" marker-end="url(#a2)" d="M777,355 L777,420 L740,420 L740,465"/>
+  <path class="edge" marker-end="url(#a2)" d="M327,430 L327,445 L650,445 L650,465"/>
+  <path class="edge" marker-end="url(#a2)" d="M777,430 L777,450 L740,450 L740,465"/>
+
+  <!-- Positions → Execute -->
+  <path class="edge" marker-end="url(#a2)" d="M650,490 L600,490 L230,490"/>
+
+  <!-- Entry filter → Execute -->
+  <path class="edge" marker-end="url(#a2)" d="M360,490 L340,490 L230,490"/>
+
+  <!-- Execute → Loop -->
+  <path class="edge" marker-end="url(#a2)" d="M140,515 L140,555 L360,555"/>
+
+  <!-- Loop → Start -->
+  <path class="edge edge-dash" marker-end="url(#a2)" d="M450,540 L450,570 L1070,570 L1070,30 L540,30"/>
+
+  <!-- Legend -->
+  <rect class="node grn" x="30" y="10" width="14" height="10" rx="2"/>
+  <text class="tiny" x="50" y="18">Start/Execute</text>
+  <rect class="node inp" x="160" y="10" width="14" height="10" rx="2"/>
+  <text class="tiny" x="180" y="18">Strategy</text>
+  <rect class="node dec" x="30" y="28" width="14" height="10" rx="2"/>
+  <text class="tiny" x="50" y="36">Decision</text>
+  <rect class="node rsk" x="160" y="28" width="14" height="10" rx="2"/>
+  <text class="tiny" x="180" y="36">Risk/Blocked</text>
+</svg>
+
+<!-- ============================================================ -->
+<!-- DIAGRAM 3: RISK & POSITION MANAGEMENT                        -->
+<!-- ============================================================ -->
+<h2>🛡️ 3. Position Management &amp; Risk Controls</h2>
+
+<svg viewBox="0 0 920 450" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="a3" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#94a3b8"/></marker>
+  </defs>
+
+  <!-- Col 1: Fatals -->
+  <rect class="zone-fill" x="15" y="15" width="280" height="200"/>
+  <rect class="zone" x="15" y="15" width="280" height="200"/>
+  <text class="zone-label" x="28" y="32">🔴 FATAL EXITS</text>
+
+  <rect class="node rsk" x="35" y="50" width="240" height="42"/>
+  <text class="label" x="155" y="68" text-anchor="middle">💀 Fatal Stop</text>
+  <text class="small" x="155" y="84" text-anchor="middle">entry - 3×ATR → SELL_ALL</text>
+
+  <rect class="node rsk" x="35" y="105" width="240" height="42"/>
+  <text class="label" x="155" y="123" text-anchor="middle">📉 -5% 물타기 차단</text>
+  <text class="small" x="155" y="139" text-anchor="middle">평단 -5% 이하 → No BUY_DOWN</text>
+
+  <rect class="node rsk" x="35" y="160" width="240" height="42"/>
+  <text class="label" x="155" y="178" text-anchor="middle">🚨 Emergency Stop</text>
+  <text class="small" x="155" y="194" text-anchor="middle">파일 감지 → 모든 거래 중단</text>
+
+  <!-- Col 2: CTP -->
+  <rect class="zone-fill" x="310" y="15" width="280" height="200"/>
+  <rect class="zone" x="310" y="15" width="280" height="200"/>
+  <text class="zone-label" x="323" y="32">🟡 CTP CASCADE</text>
+
+  <rect class="node inp" x="330" y="50" width="240" height="42"/>
+  <text class="label" x="450" y="68" text-anchor="middle">🎯 Trigger: +3% 수익</text>
+  <text class="small" x="450" y="84" text-anchor="middle">peak_gain ≥ ctp_activate_pct</text>
+
+  <rect class="node inp" x="330" y="105" width="240" height="42"/>
+  <text class="label" x="450" y="123" text-anchor="middle">🪜 사다리 설치 (4단계)</text>
+  <text class="small" x="450" y="139" text-anchor="middle">1차: 10→20→50→100%</text>
+
+  <rect class="node inp" x="330" y="160" width="240" height="42"/>
+  <text class="label" x="450" y="178" text-anchor="middle">📤 순차 SELL_PARTIAL</text>
+  <text class="small" x="450" y="194" text-anchor="middle">새 고점 → 사다리 리셋</text>
+
+  <!-- Col 3: Active Mgmt -->
+  <rect class="zone-fill" x="605" y="15" width="300" height="200"/>
+  <rect class="zone" x="605" y="15" width="300" height="200"/>
+  <text class="zone-label" x="618" y="32">🟢 ACTIVE MANAGEMENT</text>
+
+  <rect class="node grn" x="625" y="50" width="260" height="42"/>
+  <text class="label" x="755" y="68" text-anchor="middle">🔥 불타기 (Pyramid)</text>
+  <text class="small" x="755" y="84" text-anchor="middle">+0.5×ATR 상승 → 추가 1unit</text>
+
+  <rect class="node grn" x="625" y="105" width="260" height="42"/>
+  <text class="label" x="755" y="123" text-anchor="middle">💧 물타기 (Avg-Down)</text>
+  <text class="small" x="755" y="139" text-anchor="middle">-0.7~-2.1×ATR → 추가 매수</text>
+
+  <rect class="node dec" x="625" y="160" width="260" height="42"/>
+  <text class="label" x="755" y="178" text-anchor="middle">🎓 Graduation (승급)</text>
+  <text class="small" x="755" y="194" text-anchor="middle">5M +1.5ATR → 1D 포지션 승격</text>
+
+  <!-- Col 4: Portfolio Caps -->
+  <rect class="zone-fill" x="15" y="230" width="580" height="130"/>
+  <rect class="zone" x="15" y="230" width="580" height="130"/>
+  <text class="zone-label" x="28" y="247">⚖️ PORTFOLIO RISK CAPS</text>
+
+  <rect class="node rsk" x="35" y="265" width="155" height="50"/>
+  <text class="label" x="112" y="285" text-anchor="middle">1D Sleeve ≤ 6%</text>
+  <text class="small" x="112" y="302" text-anchor="middle">55일 추세 전용</text>
+
+  <rect class="node rsk" x="215" y="265" width="155" height="50"/>
+  <text class="label" x="292" y="285" text-anchor="middle">5M Sleeve ≤ 1.5%</text>
+  <text class="small" x="292" y="302" text-anchor="middle">5분 단타 전용</text>
+
+  <rect class="node rsk" x="395" y="265" width="155" height="50"/>
+  <text class="label" x="472" y="285" text-anchor="middle">Total ≤ 7%</text>
+  <text class="small" x="472" y="302" text-anchor="middle">1D + 5M 합계</text>
+
+  <rect class="node rsk" x="395" y="330" width="155" height="30"/>
+  <text class="label" x="472" y="348" text-anchor="middle">Daily Loss ≤ 5%</text>
+
+  <rect class="node inp" x="35" y="330" width="335" height="30"/>
+  <text class="label" x="202" y="348" text-anchor="middle">Position Sizing: equity × risk_pct / ATR</text>
+
+  <!-- Strategy routing -->
+  <rect class="zone-fill" x="610" y="230" width="295" height="130"/>
+  <rect class="zone" x="610" y="230" width="295" height="130"/>
+  <text class="zone-label" x="623" y="247">📊 STRATEGY RESULTS (Backtest)</text>
+
+  <text class="small" x="630" y="272">🐢 Turtle (1D, 2.7yr): +88.5%, PF 3.53, DD 17.3%</text>
+  <text class="small" x="630" y="292">🌀 Squeeze (1H, 6wk): +12.0%, PF 2.01, DD 2.5%</text>
+  <text class="small" x="630" y="312">🔄 BB+RSI (1H, 6wk): +8.3%, PF 1.55, DD 3.1%</text>
+
+  <text class="small" x="630" y="340">⚠️ Squeeze/BB+RSI는 1시간봉 6주 데이터만 — 통계 신뢰도 낮음</text>
+  <text class="small" x="630" y="355">✅ Turtle만 2.7년 전체 구간 안정적 수익 검증</text>
+</svg>
+
+</main>
