@@ -273,6 +273,12 @@ class LiveMonitor:
                     )
         except Exception as e:
             logger.error("Order failed %s %s: %s", side, ticker, e)
+            # CTP 부분매도가 실패하면 소비 대기 중인 rung 을 사다리에 되돌린다
+            try:
+                if side == "SELL" and self.engine is not None:
+                    self.engine.risk.restore_pending(ticker)
+            except Exception:
+                pass
             if self._relay:
                 self._relay.send_alert(f"❌ 주문 실패: {ticker} {side} — {e}")
 

@@ -275,8 +275,11 @@ class RegimeDetector:
             return MarketRegime.TRENDING, indicators
 
         # 1b. DC High breakout override: Donchian Channel 55-high 돌파시 ADX 무시하고 TRENDING
-        if dc_high_override and len(df) >= dc_period:
-            dc_high = df["high"].rolling(window=dc_period).max().iloc[-1]
+        if dc_high_override and len(df) >= dc_period + 1:
+            # ⚠️ 현재 봉을 채널에서 제외해야 성립한다. 현재 봉 high 를 포함하면
+            #    close ≤ high 이므로 close > max(high) 가 정의상 참이 될 수 없어
+            #    override 가 단 한 번도 발동하지 않는다(실측 0/24,453봉).
+            dc_high = df["high"].iloc[:-1].rolling(window=dc_period).max().iloc[-1]
             if current_close > dc_high:
                 indicators["details"] = (
                     f"추세장(돌파): DC{dc_period} High={dc_high:,.0f} 돌파 "
