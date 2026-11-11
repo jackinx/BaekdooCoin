@@ -44,11 +44,21 @@ class SleevePosition:
     highest_price: float = 0.0
     fire_count: int = 0
     ctp_active: bool = False
-    ctp_ladder: List = field(default_factory=list)
+    ctp_ladder: List = field(default_factory=list)      # [[trigger_price, ratio, step], ...]
+    # ---- CTP (Cascade Take-Profit) 상태 ----
+    avg_price: float = 0.0          # 평단(증액 시 갱신). 0 이면 entry_price 로 간주
+    ctp_ladder_peak: float = 0.0    # 사다리를 설치한 고점
+    ctp_ladder_gen: int = 0         # 사다리 세대(1차/재설치)
+    pending_rung: Optional[List] = None   # 체결 대기 중인 rung(주문 실패 시 복원)
+    realized_krw: float = 0.0       # 누적 실현손익
 
     @property
     def current_value_krw(self) -> int:
         return self.amount_krw
+
+    @property
+    def effective_avg_price(self) -> float:
+        return self.avg_price if self.avg_price > 0 else self.entry_price
 
 
 @dataclass
@@ -94,7 +104,7 @@ class MTFRiskManager:
         self._positions[ticker] = SleevePosition(
             ticker=ticker, sleeve=sleeve, entry_price=entry_price,
             atr=atr, amount_krw=amount_krw, risk_pct=risk_pct,
-            units=units, highest_price=entry_price,
+            units=units, highest_price=entry_price, avg_price=entry_price,
         )
         logger.info("Position added: %s [%s] ₩%d risk %.2f%%",
                     ticker, sleeve, amount_krw, risk_pct * 100)
@@ -113,6 +123,126 @@ class MTFRiskManager:
         for k, v in kwargs.items():
             if hasattr(pos, k):
                 setattr(pos, k, v)
+        return True
+
+    # ------------------------------------------------------------------
+    # CTP (Cascade Take-Profit) — 계단식 분할 익절
+    # ------------------------------------------------------------------
+    # 원본 strategies/risk.py 의 CTP 를 MTF 리스크매니저로 이식.
+    # MTF 경로는 포지션을 금액(amount_krw)으로 추적하므로 매도 비율도 금액 비율로 계산한다.
+    CTP_ACTIVATE_PCT = 3.0       # 고점 수익률이 이 값을 넘으면 사다리 설치
+    CTP_MIN_PROFIT_PCT = 2.0     # 마지막 rung 은 평단 +2% 이상일 때만 체결
+    CTP_LADDER_1 = ((0.99, 0.10), (0.97, 0.20), (0.95, 0.50), (0.93, 1.00))
+    CTP_LADDER_N = ((0.99, 0.10), (0.975, 0.10), (0.96, 0.20), (0.94, 0.60))
+
+    def record_add(self, ticker: str, price: float, add_krw: int) -> None:
+        """불타기/물타기 증액 시 평단을 갱신한다(CTP 발동선이 실제 평단을 따라가도록)."""
+        pos = self._positions.get(ticker)
+        if pos is None or price <= 0 or add_krw <= 0:
+            return
+        avg = pos.effective_avg_price
+        # 금액 기준 가중평균 (수량을 따로 저장하지 않는 MTF 모델에 맞춤)
+        new_avg = (avg * pos.amount_krw + price * add_krw) / max(pos.amount_krw + add_krw, 1)
+        pos.avg_price = new_avg
+        pos.amount_krw += int(add_krw)
+
+    def _install_ladder(self, pos: SleevePosition, peak: float) -> None:
+        pos.ctp_ladder_gen += 1
+        spec = self.CTP_LADDER_1 if pos.ctp_ladder_gen == 1 else self.CTP_LADDER_N
+        avg = pos.effective_avg_price
+        min_price = avg * (1 + self.CTP_MIN_PROFIT_PCT / 100.0)
+        ladder = []
+        for step, (mult, ratio) in enumerate(spec, start=1):
+            trig = peak * mult
+            if ratio >= 0.5:
+                # 트리거가 방어선(평단+2%)보다 아래면 영구 도달 불가 → 방어선으로 끌어올린다
+                trig = max(trig, min_price)
+            ladder.append([trig, ratio, step])
+        pos.ctp_ladder = sorted(ladder, key=lambda x: x[0], reverse=True)
+        pos.ctp_ladder_peak = peak
+        pos.ctp_active = True
+        pos.pending_rung = None
+        logger.info("〽️ CTP 사다리 설치 %s gen=%d peak=%.2f avg=%.2f rungs=%s",
+                    pos.ticker, pos.ctp_ladder_gen, peak, avg,
+                    [(round(t, 2), r) for t, r, _ in pos.ctp_ladder])
+
+    def evaluate_ctp(self, ticker: str, price: float) -> Optional[dict]:
+        """CTP 판정. 반환: None(해당 없음) | {"action": "HOLD"|"SELL_PARTIAL", ...}.
+
+        · 고점 수익률 ≥ CTP_ACTIVATE_PCT → 4단 사다리 설치(HOLD)
+        · 가격이 최상단 rung 이하로 내려오면 그 rung 을 '체결 대기'로 표시하고 SELL_PARTIAL
+        · rung 소비는 체결 확정 시(apply_partial_sell)에만 — 주문 실패 시 restore_pending
+        """
+        pos = self._positions.get(ticker)
+        if pos is None or price <= 0:
+            return None
+        pos.highest_price = max(pos.highest_price, price)
+        avg = pos.effective_avg_price
+        if avg <= 0:
+            return None
+
+        peak_gain_pct = (pos.highest_price / avg - 1.0) * 100.0
+
+        # 새 고점이면 사다리 재설치(추세 추종)
+        if pos.ctp_active and pos.highest_price > pos.ctp_ladder_peak + 1e-9:
+            self._install_ladder(pos, pos.highest_price)
+            return {"action": "HOLD",
+                    "reason": f"〽️ CTP 새 고점({peak_gain_pct:+.2f}%) → 사다리 재설치 gen={pos.ctp_ladder_gen}"}
+
+        if not pos.ctp_active:
+            if peak_gain_pct >= self.CTP_ACTIVATE_PCT:
+                self._install_ladder(pos, pos.highest_price)
+                return {"action": "HOLD",
+                        "reason": f"〽️ CTP 발동(고점 {peak_gain_pct:+.2f}%) — 사다리 4단 설치"}
+            return None
+
+        if not pos.ctp_ladder:
+            return None
+        trigger, ratio, step = pos.ctp_ladder[0]
+        if price > trigger:
+            return None
+
+        min_price = avg * (1 + self.CTP_MIN_PROFIT_PCT / 100.0)
+        if ratio >= 0.5 and price < min_price:
+            return {"action": "HOLD",
+                    "reason": (f"〽️ CTP step{step} 보류 — 평단+{self.CTP_MIN_PROFIT_PCT:.0f}%"
+                               f"({min_price:,.0f}) 미달 (현재 {price:,.0f})")}
+
+        pos.pending_rung = [trigger, ratio, step]
+        return {"action": "SELL_PARTIAL", "ratio": ratio, "step": step,
+                "reason": (f"〽️ CTP step{step}/4 {price:,.0f} ≤ {trigger:,.0f}"
+                           f" → {ratio:.0%} 익절 (평단대비 {(price / avg - 1) * 100:+.2f}%)")}
+
+    def apply_partial_sell(self, ticker: str, price: float, ratio: float) -> int:
+        """부분 익절 체결 반영: rung 소비 + 금액/실현손익 갱신. 반환=남은 amount_krw."""
+        pos = self._positions.get(ticker)
+        if pos is None:
+            return 0
+        if pos.pending_rung:
+            trig = pos.pending_rung[0]
+            if pos.ctp_ladder and abs(pos.ctp_ladder[0][0] - trig) < 1e-9:
+                pos.ctp_ladder.pop(0)
+            pos.pending_rung = None
+        ratio = min(max(ratio, 0.0), 1.0)
+        sold_krw = int(pos.amount_krw * ratio)
+        avg = pos.effective_avg_price
+        if avg > 0 and sold_krw > 0:
+            # 금액 기준 손익 근사: (체결가/평단 - 1) × 매도금액
+            pos.realized_krw += (price / avg - 1.0) * sold_krw
+        pos.amount_krw = max(pos.amount_krw - sold_krw, 0)
+        logger.info("〽️ CTP 부분익절 %s ₩%d (%.0f%%) 남은 ₩%d 실현 %.0f",
+                    ticker, sold_krw, ratio * 100, pos.amount_krw, pos.realized_krw)
+        if pos.amount_krw <= 0 or ratio >= 1.0:
+            self.remove_position(ticker)
+        return pos.amount_krw
+
+    def restore_pending(self, ticker: str) -> bool:
+        """주문 실패 시 체결 대기 rung 을 사다리에 되돌린다(사다리 유실 방지)."""
+        pos = self._positions.get(ticker)
+        if pos is None or not pos.pending_rung:
+            return False
+        pos.pending_rung = None
+        logger.warning("〽️ CTP rung 복원 %s (주문 실패)", ticker)
         return True
 
     def get_position(self, ticker: str) -> Optional[SleevePosition]:

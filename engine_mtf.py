@@ -266,6 +266,33 @@ class MTFEngine:
             summary_lines.append(f"📭 {ticker} [{pos.sleeve}] EXIT: {exit_signal.reason}")
             return
 
+        # ── CTP (Cascade Take-Profit): 계단식 분할 익절 ──
+        # 고점 +3% 에서 4단 사다리 설치 → 가격이 rung 아래로 내려오면 비율만큼 부분 매도.
+        # rung 소비는 체결 확정(apply_partial_sell)에서만 일어나고, 주문 실패 시
+        # live_monitor 가 restore_pending() 으로 되돌린다.
+        ctp = self.risk.evaluate_ctp(ticker, current_price)
+        if ctp:
+            if ctp["action"] == "SELL_PARTIAL":
+                ratio = float(ctp["ratio"])
+                sell_krw = int(pos.amount_krw * ratio)
+                if sell_krw >= 5_000:
+                    orders.append(MTFOrder(
+                        ticker=ticker, side="SELL", sleeve=pos.sleeve,
+                        amount_krw=sell_krw, price=current_price,
+                        reason=ctp["reason"], atr=current_atr,
+                    ))
+                    self.risk.apply_partial_sell(ticker, current_price, ratio)
+                    strat.record_trade("CTP")
+                    self._daily_trades_count += 1
+                    summary_lines.append(
+                        f"〽️ {ticker} [{pos.sleeve}] CTP {ratio:.0%} (₩{sell_krw:,}) — {ctp['reason']}")
+                else:
+                    summary_lines.append(
+                        f"〽️ {ticker} [{pos.sleeve}] CTP 보류 — 최소주문 미달 (₩{sell_krw:,})")
+            else:
+                summary_lines.append(f"{ctp['reason']}")
+            return
+
         # Track highest price
         if current_price > pos.highest_price:
             self.risk.update_position(ticker, highest_price=current_price)
@@ -295,9 +322,10 @@ class MTFEngine:
                     reason=f"🔥 불타기: +{pnl_pct:+.1f}% (price>{up_trigger:,.0f}, eq×{ratio:.4f})",
                     atr=current_atr,
                 ))
+                # 평단 갱신(CTP 발동선이 실제 평단을 따라가도록) + 수량 증가
+                self.risk.record_add(ticker, current_price, add_size)
                 self.risk.update_position(
-                    ticker, amount_krw=pos.amount_krw + add_size,
-                    units=pos.units + 1, highest_price=current_price,
+                    ticker, units=pos.units + 1, highest_price=current_price,
                 )
                 strat.record_trade("BUY_UP")
                 self._daily_trades_count += 1
@@ -326,9 +354,8 @@ class MTFEngine:
                            f"(price<{threshold:,.0f}, unit{pos.units+1}/{max_units})",
                     atr=current_atr,
                 ))
-                self.risk.update_position(
-                    ticker, amount_krw=pos.amount_krw + add_size, units=pos.units + 1,
-                )
+                self.risk.record_add(ticker, current_price, add_size)
+                self.risk.update_position(ticker, units=pos.units + 1)
                 strat.record_trade("BUY_DOWN")
                 self._daily_trades_count += 1
                 summary_lines.append(
