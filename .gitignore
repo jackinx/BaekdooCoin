@@ -36,3 +36,9 @@ Thumbs.db
 
 # Temp
 /tmp/
+
+# Windows port
+logs/
+*.coverage
+.coverage*
+replay_runtime/
