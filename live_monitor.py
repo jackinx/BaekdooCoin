@@ -1,538 +1,540 @@
+# -*- coding: utf-8 -*-
+"""라이브 모니터 (원본 live_monitor.py) — Windows 포팅.
+
+실행:
+  python live_monitor.py                  # 감시만 (주문 없음) ← 먼저 이걸로 며칠 관찰
+  python live_monitor.py --trade          # 실제 주문 (⚠️ 실제 자금)
+  python live_monitor.py --once           # 1사이클만 실행하고 종료 (점검용)
+  python live_monitor.py --no-ws          # WebSocket 없이 DB 종가만으로 사이클
+
+스레드:
+  ws        업비트 WebSocket → 실시간 가격 캐시
+  updater   5분마다 data_updater.py (증분 갱신)
+  telegram  /status /stop /resume ... (chat_id 화이트리스트)
+  main      1분마다 engine.run_cycle() → 주문 실행
 """
-백두코인봇 라이브 모니터 — 실시간 시세 감시 + 자동매매 (RiskManager v2 통합)
-====================================================================
-
-업비트 WebSocket을 통해 실시간 가격을 수신하고,
-백두코인봇Engine을 1분마다 실행하여 신호를 생성 및 주문 실행.
-
-RiskManager v2가 엔진 내에 내장되어 있으므로 별도 전략 로직 불필요.
-
-사용법:
-    python live_monitor.py           # 감시만 (주문 안 함)
-    python live_monitor.py --trade   # 감시 + 자동매매
-
-동작 방식:
-    1. WebSocket으로 10종 실시간 체결가 수신 (_price_cache)
-    2. 1분마다 engine.run_cycle() 실행 (레짐 감지 → 전략 선택 → 신호 → 주문 생성)
-    3. 생성된 주문을 시장가 매수/매도 (KRW 금액 기준)
-    4. 비상정지(/stop)는 텔레그램으로 제어
-"""
-
 from __future__ import annotations
 
+import argparse
 import json
 import logging
-import time
+import os
+import signal
+import sys
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
-logger = logging.getLogger(__name__)
+import requests
+
+import datastore
+import paths
+from config import Config
+from engine_mtf import MTFEngine
+from telegram_control import HELP_TEXT, TelegramController
+from upbit_client import UpbitClient, UpbitError
+
+log = logging.getLogger("baekdoocoin")
+
+
+# ---------------- 로깅 ----------------
+def setup_logging(verbose: bool = False) -> None:
+    paths.ensure_dirs()
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+    fh = RotatingFileHandler(paths.LOG_DIR / "live.log", maxBytes=8_000_000, backupCount=5,
+                             encoding="utf-8")
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+
+# ---------------- PID 락 ----------------
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(h)
+        return bool(ok) and code.value == 259        # STILL_ACTIVE
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+class PidLock:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def acquire(self) -> bool:
+        """O_CREAT|O_EXCL 로 원자적 배타 생성 (check-then-write 는 경쟁 조건이 있다)."""
+        paths.ensure_dirs()
+        for _ in range(2):
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                return True
+            except FileExistsError:
+                try:
+                    pid = int(self.path.read_text().strip() or 0)
+                except (ValueError, OSError):
+                    pid = 0
+                if _pid_alive(pid):
+                    log.error("이미 실행 중 (PID %d). 중복 실행 방지.", pid)
+                    return False
+                log.warning("죽은 PID %s 락 정리", pid)
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+        return False
+
+    def release(self) -> None:
+        try:
+            if self.path.exists() and self.path.read_text().strip() == str(os.getpid()):
+                self.path.unlink()
+        except Exception:                            # noqa: BLE001
+            pass
+
+
+# ---------------- 라이브 모니터 ----------------
+PRICE_MAX_AGE_S = 120          # WS 가격 신선도 상한 (초)
 
 
 class LiveMonitor:
-    """실시간 시세 감시 + 엔진 기반 자동매매.
-
-    업비트 WebSocket + 엔진 기반 주문 생성.
-    """
-
-    # 감시할 티커 (메이저 10종)
-    TICKERS = [
-        "KRW-BTC", "KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-ADA",
-        "KRW-DOGE", "KRW-AVAX", "KRW-DOT", "KRW-POL", "KRW-LINK",
-    ]
-
-    def __init__(
-        self,
-        config,
-        db_path: str = "data/upbit_v2.db",
-        *,
-        trading_enabled: bool = False,
-    ):
-        """
-        Parameters
-        ----------
-        config : Config
-            config.py에서 로드한 설정.
-        db_path : str
-            SQLite DB 경로.
-        trading_enabled : bool
-            True면 실제 주문 실행.
-        """
-        self.config = config
-        self.db_path = db_path
-        self.trading_enabled = trading_enabled
-
-        # 실시간 가격 캐시: {ticker: {"price": float, "timestamp": float}}
-        self._price_cache: dict[str, dict] = {}
+    def __init__(self, cfg: Config, trade: bool = False, use_ws: bool = True,
+                 paper: Optional[bool] = None):
+        self.cfg = cfg
+        self.trade = trade
+        self.use_ws = use_ws
+        self.paper = (not trade) if paper is None else bool(paper)
+        self.db = cfg.db_path
+        self._prices: Dict[str, dict] = {}
         self._price_lock = threading.Lock()
+        self._equity_fail = 0
+        self._order_fail: Dict[str, int] = {}
 
-        # 엔진 및 클라이언트 (lazy init)
-        self._upbit_client = None
-        self._relay = None  # OpenClawRelay (파일 기반 IPC)
-        self.engine = None
-
-        # 상태
-        self._running = False
-        self._emergency_stop = False
-        self._paused = False  # /pause 명령으로 엔진 사이클 일시정지
-        self._last_cycle_run: float = 0.0  # 엔진 실행 간격 추적
-
-        # DB 초기화 확인
-        if not Path(db_path).exists():
-            logger.warning("DB 없음: %s — 데이터 먼저 수집 필요 (python data_crawler_v2.py)", db_path)
-
-    # ------------------------------------------------------------------
-    # WebSocket 가격 수신
-    # ------------------------------------------------------------------
-    def _on_ticker(self, data: dict) -> None:
-        """WebSocket ticker 메시지 핸들러."""
-        try:
-            ticker = data.get("code", "")
-            price = float(data.get("trade_price", 0))
-            ts = data.get("trade_timestamp", 0) / 1000.0
-            with self._price_lock:
-                self._price_cache[ticker] = {"price": price, "timestamp": ts}
-        except (ValueError, TypeError) as e:
-            logger.debug("ticker 파싱 오류: %s", e)
-
-    def _ws_connect(self) -> None:
-        """업비트 WebSocket 연결 루프 (재접속 포함)."""
-        import websocket  # 지연 임포트
-
-        codes = self.TICKERS
-        ws_url = "wss://api.upbit.com/websocket/v1"
-
-        while self._running and not self._emergency_stop:
+        self.client: Optional[UpbitClient] = None
+        if cfg.has_upbit():
             try:
-                ws = websocket.WebSocket()
-                ws.connect(ws_url, timeout=10)
-                # 구독 메시지
-                subscribe = json.dumps([
-                    {"ticket": "baekdoocoin"},
-                    {"type": "ticker", "codes": codes, "is_only_realtime": True},
-                ])
-                ws.send(subscribe)
-                logger.info("WebSocket 연결됨 — %d종 감시 중", len(codes))
+                self.client = UpbitClient(cfg.upbit_access_key, cfg.upbit_secret_key)
+            except UpbitError as e:
+                log.error("업비트 클라이언트 생성 실패: %s", e)
 
-                while self._running and not self._emergency_stop:
-                    try:
-                        ws.settimeout(5)
-                        raw = ws.recv()
-                        data = json.loads(raw)
-                        self._on_ticker(data)
-
-                        # 주기적 엔진 실행
-                        self._maybe_run_cycle()
-
-                    except websocket.WebSocketTimeoutException:
-                        self._maybe_run_cycle()
-                        continue
-                    except json.JSONDecodeError:
-                        continue
-
-                ws.close()
-            except Exception as e:
-                if self._running and not self._emergency_stop:
-                    logger.error("WebSocket 오류 — 5초 후 재접속: %s", e)
-                    time.sleep(5)
-
-    # ------------------------------------------------------------------
-    # 엔진 통합
-    # ------------------------------------------------------------------
-    def _result_as_dict(self, result) -> dict:
-        """Normalize engine result to dict (compat: legacy dict vs MTF dataclass)."""
-        if isinstance(result, dict):
-            return result
-        # Convert dataclass to dict-like access
-        return {
-            "emergency_stop": getattr(result, "emergency_stop", None),
-            "orders": [
-                {
-                    "ticker": o.ticker,
-                    "side": o.side,
-                    "amount_krw": o.amount_krw,
-                    "price": o.price,
-                    "strategy": f"mtf-{o.sleeve}",
-                    "reason": o.reason,
-                    "client_order_id": o.client_order_id or f"baekdoocoin-{o.ticker}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
-                }
-                for o in getattr(result, "orders", [])
-            ],
-            "summary": getattr(result, "summary", ""),
-            "regimes": getattr(result, "regimes", {}),
-        }
-
-    def _maybe_run_cycle(self) -> None:
-        """Run engine cycle and execute orders."""
-        if self._paused:
-            return
-        now = time.monotonic()
-        if now - self._last_cycle_run < 60.0:
-            return
-        self._last_cycle_run = now
-
-        try:
-            # Update equity from live balance (총 평가액 = 원화 + 코인)
-            if self._upbit_client:
-                try:
-                    live_equity = self._upbit_client.get_total_equity_krw()
-                    if live_equity > 0:
-                        self.engine.equity_krw = live_equity
-                except Exception:
-                    pass  # keep cached equity
-
-            # 실시간가 캐시를 엔진에 전달 (당일 돌파 감지용)
-            live_prices = {}
-            with self._price_lock:
-                for ticker, data in self._price_cache.items():
-                    if data.get("price", 0) > 0:
-                        live_prices[ticker] = data["price"]
-
-            # Run engine cycle with live prices (legacy engine supports live_prices kwarg)
+        equity = cfg.initial_equity_krw
+        if self.client:
             try:
-                raw_result = self.engine.run_cycle(live_prices=live_prices)
-            except TypeError:
-                raw_result = self.engine.run_cycle()
-            result = self._result_as_dict(raw_result)
+                eq = self.client.get_total_equity_krw()
+                if eq > 0:
+                    equity = eq
+            except Exception as e:                   # noqa: BLE001
+                log.warning("총 평가액 조회 실패(기본 자본 사용): %s", e)
 
-            if result.get("emergency_stop"):
-                self._emergency_stop = True
-                if self._relay:
-                    self._relay.send_alert(f"🚨 Emergency Stop: {result['emergency_stop']}")
-                return
+        self.engine = MTFEngine(
+            tickers=cfg.tickers, db_path=self.db, equity_krw=equity, client=self.client,
+            max_daily_loss_pct=cfg.max_daily_loss_pct, max_daily_trades=cfg.max_daily_trades,
+            max_orders_per_cycle=cfg.max_orders_per_cycle, paper=self.paper,
+            start_equity_krw=cfg.start_equity_krw,
+        )
+        if self.client:
+            self.engine.sync_from_exchange()
 
-            # Execute orders
-            for order in result.get("orders", []):
-                self._execute_cycle_order(order)
+        self._public = requests.Session()
+        self.tg: Optional[TelegramController] = None
+        self._stop = threading.Event()
+        self._cycle_no = 0
 
-            # Send summary if there were orders
-            if result.get("orders"):
-                summary = result.get("summary", "")
-                if summary and self._relay:
-                    self._relay.send_alert(summary[:1000])
-
-        except Exception as e:
-            logger.error("Cycle error: %s", e)
-
-    def _execute_cycle_order(self, order: dict) -> None:
-        """Execute a single order generated by engine.run_cycle()."""
-        ticker = order["ticker"]
-        side = order["side"]
-        amount_krw = order["amount_krw"]
-        strategy = order.get("strategy", "?")
-        reason = order.get("reason", "")
-        client_id = order.get("client_order_id", "")
-
-        if not self._upbit_client:
-            return
-
+    def _public_price(self, ticker: str) -> Optional[float]:
+        """API 키 없이 공개 시세 조회 — 키 발급 전 '관찰 모드'용."""
         try:
-            if side == "BUY":
-                if self.trading_enabled:
-                    result = self._upbit_client.market_buy(ticker, amount_krw, client_order_id=client_id)
-                    logger.info("BUY %s KRW %d -> %s", ticker, amount_krw, result.get("uuid", "?"))
-                if self._relay:
-                    self._relay.send_alert(
-                        f"{'✅' if self.trading_enabled else '🧪'} BUY {ticker}\n"
-                        f"금액: ₩{amount_krw:,}\n전략: {strategy}\n사유: {reason}"
-                    )
+            r = self._public.get("https://api.upbit.com/v1/ticker", params={"markets": ticker},
+                                 timeout=8, headers={"User-Agent": "baekdoocoin-win/1.0"})
+            r.raise_for_status()
+            return float(r.json()[0]["trade_price"])
+        except Exception as e:                            # noqa: BLE001
+            log.debug("공개 시세 조회 실패 %s: %s", ticker, e)
+            return None
 
-            elif side == "SELL":
-                if self.trading_enabled:
-                    sell_result = None
-                    try:
-                        sell_result = self._upbit_client.market_sell_amount(ticker, amount_krw, client_order_id=client_id)
-                    except Exception as sell_err:
-                        err_str = str(sell_err).lower()
-                        if "under_min_total" in err_str or ("5000" in err_str and "최소" in err_str):
-                            logger.warning(
-                                "SELL %s amount_krw=%d below min — buy 5k first then sell all",
-                                ticker, amount_krw)
-                            try:
-                                self._upbit_client.market_buy(ticker, 5000)
-                                time.sleep(0.5)
-                            except Exception as buy_err:
-                                logger.warning("Workaround buy failed: %s", buy_err)
-                                raise sell_err
-                            coin_bal, _ = self._upbit_client.get_coin_balance(ticker)
-                            if coin_bal > 0:
-                                sell_result = self._upbit_client.market_sell(
-                                    ticker, coin_bal, client_order_id=client_id)
-                            else:
-                                raise sell_err
-                        else:
-                            raise sell_err
-                    if sell_result:
-                        logger.info("SELL %s KRW %d -> %s", ticker, amount_krw, sell_result.get("uuid", "?"))
-                if self._relay:
-                    self._relay.send_alert(
-                        f"{'✅' if self.trading_enabled else '🧪'} SELL {ticker}\n"
-                        f"금액: ₩{amount_krw:,}\n사유: {reason}"
-                    )
-        except Exception as e:
-            logger.error("Order failed %s %s: %s", side, ticker, e)
-            if self._relay:
-                self._relay.send_alert(f"❌ 주문 실패: {ticker} {side} — {e}")
-
-    # ------------------------------------------------------------------
-    # 상태 조회 (Telegram /status 용)
-    # ------------------------------------------------------------------
-    def _get_status(self) -> str:
-        """Telegram /status 콜백: 엔진 상태 요약."""
-        if self.engine is None:
-            return "엔진 미초기화"
+    # ---------------- 자본(equity) ----------------
+    def _refresh_equity(self) -> bool:
+        """사이클마다 총 평가액을 갱신한다 — 이게 없으면 일일손실 킬스위치가 죽는다(감사 F01)."""
+        if not self.client:
+            return False
         try:
-            # Open positions from engine
-            open_pos = getattr(self.engine, "_open_positions", {})
-            # Latest prices from cache
-            with self._price_lock:
-                latest_prices = {t: data["price"] for t, data in self._price_cache.items() if data["price"] > 0}
-            # Equity
-            equity = getattr(self.engine, "equity_krw", 0)
-            lines = [
-                "📊 백두코인봇 엔진 상태",
-                f"자본금: ₩{equity:,.0f}",
-                f"열린 포지션: {len(open_pos)}개",
-            ]
-            for ticker, info in open_pos.items():
-                entry_price = info.get("entry_price", 0)
-                qty = info.get("qty", 0)
-                lines.append(f"  • {ticker}: {qty:.6f} @ ₩{entry_price:,.0f}")
-            lines.append("\n💹 최신 가격 (캐시):")
-            for ticker in self.TICKERS:
-                price = latest_prices.get(ticker, 0.0)
-                if price > 0:
-                    lines.append(f"  {ticker}: ₩{price:,.0f}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"상태 조회 오류: {e}"
+            eq = float(self.client.get_total_equity_krw())
+        except Exception as e:                       # noqa: BLE001
+            eq = 0.0
+            log.warning("총 평가액 조회 실패: %s", e)
+        if eq <= 0:
+            self._equity_fail += 1
+            self.engine.external_block = (
+                f"자본 조회 실패 {self._equity_fail}회 — 신규 진입 차단" if self._equity_fail >= 3 else None)
+            return False
+        self._equity_fail = 0
+        self.engine.external_block = None
+        self.engine.equity_krw = eq
+        self.engine.risk.equity_krw = eq
+        return True
 
-    # ------------------------------------------------------------------
-    # 백그라운드 데이터 업데이트
-    # ------------------------------------------------------------------
-    def _update_loop(self) -> None:
-        """주기적 DB 업데이트 (최신 OHLCV 반영)."""
-        while self._running and not self._emergency_stop:
-            try:
-                import subprocess, sys
-                subprocess.run(
-                    [sys.executable, "data_updater.py", "--db", self.db_path],
-                    cwd=Path(__file__).parent,
-                    capture_output=True,
-                    timeout=120,
-                )
-                logger.info("DB 업데이트 완료")
-            except Exception as e:
-                logger.error("DB 업데이트 오류: %s", e)
-            # 다음 업데이트까지 5분 대기
-            for _ in range(300):
-                if not self._running or self._emergency_stop:
-                    break
-                time.sleep(1)
-
-    # ------------------------------------------------------------------
-    # 잔고 조회 (/balance 명령용)
-    # ------------------------------------------------------------------
-    def _get_balance(self) -> str:
-        """업비트 잔고 요약 문자열 반환."""
-        if self._upbit_client is None:
-            return "업비트 클라이언트 미초기화"
-        try:
-            krw = self._upbit_client.get_krw_balance()
-            balances = self._upbit_client.get_all_balances()  # {ticker: {qty, avg_price, value_krw}}
-            lines = [f"💰 KRW: ₩{krw:,.0f}"]
-            total_coin = 0.0
-            for ticker, info in sorted(balances.items()):
-                qty = info.get("qty", 0)
-                value = info.get("value_krw", 0)
-                if qty <= 0:
+    # ---------------- 가격 ----------------
+    def live_prices(self, max_age_s: int = PRICE_MAX_AGE_S) -> Dict[str, float]:
+        """신선한 가격만 반환 — 스테일 가격으로 주문하지 않는다(감사 F10)."""
+        now = datetime.now(timezone.utc)
+        out: Dict[str, float] = {}
+        with self._price_lock:
+            for t, v in self._prices.items():
+                px = float(v.get("price") or 0)
+                ts = v.get("ts")
+                if px <= 0 or not ts:
                     continue
-                total_coin += value
-                lines.append(f"  • {ticker}: {qty:.8f} (≈₩{value:,.0f})")
-            lines.append(f"합계 평가액: ₩{krw + total_coin:,.0f}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"잔고 조회 오류: {e}"
+                try:
+                    age = (now - datetime.fromisoformat(ts)).total_seconds()
+                except ValueError:
+                    continue
+                if age <= max_age_s:
+                    out[t] = px
+                else:
+                    log.debug("%s 가격 스테일(%.0fs) — 제외", t, age)
+        return out
 
-    # ------------------------------------------------------------------
-    # 명령 폴링 루프 (OpenClaw 릴레이)
-    # ------------------------------------------------------------------
-    def _handle_command(self, cmd: dict) -> None:
-        """command.json에서 읽은 명령 1건 처리."""
-        command = str(cmd.get("command", "")).strip().lstrip("/").lower()
-        logger.info("릴레이 명령 처리: %s", command)
-
-        if command == "status":
-            self._relay.send_alert(self._get_status())
-        elif command == "balance":
-            self._relay.send_alert(self._get_balance())
-        elif command == "stop":
-            self._tg_stop()
-            self._relay.send_alert("🚨 비상정지 실행됨 (/stop) — 모든 매매 중단")
-        elif command == "resume":
-            self._tg_resume()
-            self._relay.send_alert("✅ 매매 재개됨 (/resume)")
-        elif command == "pause":
-            self._paused = True
-            self._relay.send_alert("⏸️ 엔진 일시정지 (/pause) — 새 사이클 중단")
-        elif command in ("help", "start"):
-            self._relay.send_alert(
-                "📖 백두코인봇 명령어\n"
-                "/status — 엔진 상태\n/balance — 잔고 조회\n"
-                "/pause — 일시정지\n/resume — 재개\n/stop — 비상정지"
-            )
-        else:
-            self._relay.send_alert(f"❓ 알 수 없는 명령: /{command}")
-
-    def _command_loop(self) -> None:
-        """2초마다 릴레이에서 미처리 명령을 확인해 처리."""
-        while self._running:
+    def _ws_loop(self) -> None:
+        import websocket                                  # websocket-client
+        url = "wss://api.upbit.com/websocket/v1"
+        sub = [{"ticket": "baekdoocoin-win"}, {"type": "ticker", "codes": self.cfg.tickers,
+                                               "is_only_realtime": True}]
+        while not self._stop.is_set():
             try:
-                cmd = self._relay.get_pending_command()
-                if cmd is not None:
-                    self._handle_command(cmd)
-            except Exception as e:
-                logger.error("명령 루프 오류: %s", e)
-            # 2초 대기 (종료 신호 빠르게 감지)
-            for _ in range(20):
-                if not self._running:
-                    break
-                time.sleep(0.1)
+                ws = websocket.create_connection(url, timeout=20)
+                ws.send(json.dumps(sub))
+                log.info("WebSocket 연결 — %d종 구독", len(self.cfg.tickers))
+                while not self._stop.is_set():
+                    raw = ws.recv()
+                    if not raw:
+                        break
+                    d = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                    code, price = d.get("code"), d.get("trade_price")
+                    if code and price:
+                        with self._price_lock:
+                            self._prices[code] = {"price": float(price),
+                                                  "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                ws.close()
+            except Exception as e:                        # noqa: BLE001
+                log.warning("WebSocket 오류: %s — 5초 후 재연결", e)
+                time.sleep(5)
 
-    # ------------------------------------------------------------------
-    # 실행
-    # ------------------------------------------------------------------
-    def start(self) -> None:
-        """라이브 모니터 시작."""
-        self._running = True
-
-        # 업비트 클라이언트 초기화
-        if self.config.has_upbit():
-            from upbit_client import UpbitClient
-            self._upbit_client = UpbitClient(
-                self.config.upbit_access_key, self.config.upbit_secret_key,
-            )
-            if self._upbit_client.check_connection():
-                krw = self._upbit_client.get_krw_balance()
-                logger.info("업비트 연결 성공 — 원화 잔고: ₩%.0f", krw)
-
-        # OpenClaw 릴레이 초기화 (파일 기반 — Telegram 직접 호출 없음)
-        from openclaw_relay import OpenClawRelay
-        self._relay = OpenClawRelay()
-        self._relay.start()
-        self._relay.send_alert("🟢 백두코인봇 라이브 모니터 시작됨 (OpenClaw 릴레이)\n감시: 10종, 거래: %s" %
-                              ("활성" if self.trading_enabled else "비활성"))
-
-        # 엔진 초기화 — MTF (1D+5M Dual Sleeve) first, fallback to legacy
-        # 초기 equity는 원화 현금 + 보유 코인 평가액 합산 (총 평가액 기준)
-        init_equity = 1_000_000
-        if self._upbit_client:
+    def _updater_loop(self, every: int = 300) -> None:
+        from data_updater import update
+        while not self._stop.is_set():
             try:
-                total_equity = self._upbit_client.get_total_equity_krw()
-                if total_equity > 0:
-                    init_equity = total_equity
-            except Exception:
-                pass
+                n = update(self.db, self.cfg.tickers, ["1d", "4h", "1h"])
+                if n:
+                    log.info("데이터 갱신 %d행", n)
+            except Exception as e:                        # noqa: BLE001
+                log.warning("데이터 갱신 실패: %s", e)
+            self._stop.wait(every)
 
-        # Use MTF engine (5M data capped at 500 bars, ~1s per cycle)
-        engine_type = "legacy"
+    # ---------------- 주문 실행 ----------------
+    def _exchange_qty(self, ticker: str) -> Optional[float]:
+        """거래소 실보유 수량 (조회 실패면 None)."""
+        if not self.client:
+            return None
         try:
-            from engine_mtf import MTFEngine
-            self.engine = MTFEngine(
-                db_path=self.db_path,
-                tickers=self.TICKERS,
-                equity_krw=init_equity,
-            )
-            engine_type = "MTF (1D+5M)"
-            # Sync actual exchange positions into engine
-            if self._upbit_client:
-                n = self.engine.sync_from_exchange(self._upbit_client)
-                if n > 0:
-                    logger.info("Exchange sync: %d positions loaded", n)
-        except ImportError as e:
-            logger.warning("MTF not available (%s), falling back to legacy", e)
-            from engine import 백두코인봇Engine
-            self.engine = 백두코인봇Engine(
-                db_path=self.db_path,
-                tickers=self.TICKERS,
-                equity_krw=init_equity,
-            )
-        logger.info("Engine initialized: %s (equity=₩%s)", engine_type, f"{init_equity:,}")
+            bal = self.client.get_coin_balance(ticker)
+            return float(bal[0]) if isinstance(bal, tuple) else float(bal)
+        except Exception as e:                            # noqa: BLE001
+            log.warning("잔고 조회 실패 %s: %s", ticker, e)
+            return None
 
-        # WebSocket 스레드
-        ws_thread = threading.Thread(target=self._ws_connect, daemon=True, name="baekdoocoin-ws")
-        ws_thread.start()
+    def _execute(self, order: dict) -> bool:
+        ticker, kind = order["ticker"], order["kind"]
+        price = float(order.get("price") or 0)
+        if not self.trade or self.client is None:
+            log.info("[PAPER] %s %s %s", kind, ticker, order.get("reason", ""))
+            self._order_fail[ticker] = 0
+            return True
 
-        # DB 업데이트 스레드
-        update_thread = threading.Thread(target=self._update_loop, daemon=True, name="baekdoocoin-update")
-        update_thread.start()
+        try:
+            if kind in ("BUY", "BUY_UP", "BUY_DOWN", "GRADUATE"):
+                amt = float(order["amount_krw"])
+                if kind == "GRADUATE":
+                    pos = self.engine.risk.get(ticker)
+                    if pos and pos.extras.get("qty", 0) > 0:
+                        self.client.market_sell(ticker, pos.extras["qty"])
+                        log.info("승급 매도 %s %.8f개", ticker, pos.extras["qty"])
+                self.client.market_buy(ticker, amt)
+                log.info("✅ 매수 %s %s KRW (%s)", ticker, f"{amt:,.0f}", order.get("reason", ""))
+            elif kind in ("SELL_ALL", "SELL_PARTIAL"):
+                pos = self.engine.risk.get(ticker)
+                if not pos:
+                    log.warning("매도 대상 포지션 없음: %s", ticker)
+                    return False
+                qty = pos.extras.get("qty", 0.0) * float(order.get("ratio", 1.0))
+                # 거래소 실잔고로 클램프 — 추적 수량이 부풀어 있으면 매도가 거부된다(감사 LIFECYCLE-01)
+                live_qty = self._exchange_qty(ticker)
+                if live_qty is not None:
+                    if live_qty <= 0:
+                        log.warning("%s 거래소 잔고 0 — 매도 생략", ticker)
+                        return False
+                    qty = min(qty, live_qty)
+                if qty <= 0:
+                    return False
+                self.client.market_sell(ticker, qty)
+                log.info("✅ 매도 %s %.8f개 (%s)", ticker, qty, order.get("reason", ""))
+            else:
+                log.warning("알 수 없는 주문 종류: %s", kind)
+                return False
+            self._order_fail[ticker] = 0
+            return True
+        except Exception as e:                            # noqa: BLE001
+            n = self._order_fail.get(ticker, 0) + 1
+            self._order_fail[ticker] = n
+            log.error("❌ 주문 실패 %s %s (%d회): %s", kind, ticker, n, e)
+            if n >= 2:                                   # 반복 실패는 조용히 넘기지 않는다
+                msg = f"🚨 {ticker} 주문 {n}회 연속 실패 — {kind}: {e}"
+                log.error(msg)
+                if self.tg:
+                    self.tg.send(msg)
+                if kind in ("SELL_ALL", "SELL_PARTIAL") and n >= 3:
+                    paths.emergency_stop()
+                    if self.tg:
+                        self.tg.send("🚨 청산 반복 실패 → 킬스위치 생성(수동 확인 필요)")
+            return False
 
-        # 명령 폴링 스레드 (OpenClaw 릴레이)
-        cmd_thread = threading.Thread(target=self._command_loop, daemon=True, name="baekdoocoin-cmd")
-        cmd_thread.start()
+    # ---------------- 상태 응답 ----------------
+    def _tg_status(self) -> str:
+        lines = ["📊 백두코인봇 상태",
+                 f"모드: {'🔴 실거래' if self.trade else '🟡 감시(주문없음)'} · "
+                 f"WS: {'ON' if self.use_ws else 'OFF'} · 사이클 {self._cycle_no}회"]
+        if paths.emergency_active():
+            lines.append("🚨 킬스위치 ON")
+        if paths.paused():
+            lines.append("⏸️ 일시정지 상태")
+        if self.engine.state_error:
+            lines.append(f"⚠️ 상태파일 오류: {self.engine.state_error}")
+        if self.engine.external_block:
+            lines.append(f"⚠️ {self.engine.external_block}")
+        lines += self.engine.status_lines()
+        lp = self.live_prices()
+        if lp:
+            lines.append("실시간가: " + ", ".join(f"{k.replace('KRW-', '')}={v:,.4f}" for k, v in list(lp.items())[:6]))
+        return "\n".join(lines)
 
-        logger.info("백두코인봇 라이브 모니터 시작 — 10종 실시간 감시, 거래: %s",
-                    "활성" if self.trading_enabled else "비활성")
+    def _tg_balance(self) -> str:
+        if not self.client:
+            return "업비트 키 미설정 — .env 확인"
+        krw = self.client.get_krw_balance()
+        total = self.client.get_total_equity_krw()
+        out = [f"💰 원화 {krw:,.0f} KRW / 총평가 {total:,.0f} KRW"]
+        for t, i in self.client.get_all_balances().items():
+            out.append(f"  {t}: {i['qty']:.8f}개 평단 {i['avg_price']:,.4f} 평가 {i['value_krw']:,.0f}")
+        return "\n".join(out)
 
-    def stop(self) -> None:
-        """정상 종료."""
-        self._running = False
-        if self._relay:
-            self._relay.send_alert("🔴 백두코인봇 모니터 종료됨")
-            self._relay.stop()
-        logger.info("백두코인봇 모니터 종료")
+    def _tg_positions(self) -> str:
+        snaps = self.engine._snapshot_positions(self.live_prices())
+        if not snaps:
+            return "보유 포지션 없음"
+        return "\n".join(
+            f"{s['ticker']} [{s['sleeve']}] {s['qty']:.6f}개 평단 {s['avg_price']:,.4f} "
+            f"현재 {s['price']:,.4f} ({s['pnl_pct']:+.2f}%) peak {s['peak_pct']:+.2f}% CTP {s['ctp']}"
+            for s in snaps)
 
-    # 텔레그램 콜백
-    def _tg_stop(self) -> None:
-        self._emergency_stop = True
-        Path("/tmp/baekdoocoin_emergency_stop").touch()
-        logger.warning("🚨 텔레그램 비상정지 명령 수신")
+    def _tg_regime(self) -> str:
+        from strategies.regime_detector import RegimeDetector
+        det = RegimeDetector()
+        out = ["🌡️ 레짐 (1H, DC55 override)"]
+        for t in self.cfg.tickers:
+            c = datastore.load(self.db, "1h", t, limit=600)
+            if len(c) < 60:
+                out.append(f"  {t}: 데이터 없음")
+                continue
+            r, x = det.detect_regime(c, dc_high_override=True)
+            out.append(f"  {t.replace('KRW-', '')}: {r.value} ADX={x['adx']:.0f} RSI={x['rsi']:.0f}")
+        return "\n".join(out)
 
-    def _tg_resume(self) -> None:
-        self._emergency_stop = False
-        p = Path("/tmp/baekdoocoin_emergency_stop")
-        if p.exists():
-            p.unlink()
-        logger.info("✅ 텔레그램 재개 명령 수신")
+    def _tg_data(self) -> str:
+        rows = datastore.stats(self.db)
+        if not rows:
+            return "DB 비어 있음 — data_crawler.py 또는 tools/import_legacy_db.py 실행"
+        lines = ["🗄️ DB 통계"]
+        for r in rows:
+            if r["ticker"] in self.cfg.tickers:
+                lines.append(f"  {r['timeframe']:>3} {r['ticker']:<10} {r['rows']:>6}행 ~{r['to'][:10]}")
+        return "\n".join(lines)
+
+    def _setup_telegram(self) -> None:
+        if not self.cfg.has_telegram():
+            log.info("텔레그램 미설정 — 원격제어 생략")
+            return
+        handlers = {
+            "start": lambda: HELP_TEXT,
+            "help": lambda: HELP_TEXT,
+            "_help_text": lambda: HELP_TEXT,
+            "status": self._tg_status,
+            "balance": self._tg_balance,
+            "positions": self._tg_positions,
+            "regime": self._tg_regime,
+            "data": self._tg_data,
+            "stop": self._tg_stop,
+            "resume": self._tg_resume,
+            "pause": self._tg_pause,
+        }
+        self.tg = TelegramController(self.cfg.telegram_bot_token, self.cfg.telegram_chat_id, handlers)
+        self.tg.start_polling()
+        self.tg.send("🤖 백두코인봇(Windows) 시작 — "
+                     f"{'🔴 실거래' if self.trade else '🟡 감시 모드'} / {len(self.cfg.tickers)}종\n/help 로 명령 확인")
+
+    def _tg_stop(self) -> str:
+        self.engine.stop("telegram /stop")
+        paths.emergency_stop()
+        return "🚨 비상정지 ON — 모든 매매 중단 (kill-switch 파일 생성)"
+
+    def _tg_resume(self) -> str:
+        self.engine.resume()
+        return "▶️ 매매 재개 (kill-switch 제거)"
+
+    def _tg_pause(self) -> str:
+        paths.pause()                      # 파일로 남겨 재시작 후에도 유지된다
+        return "⏸️ 일시정지 (신규 진입 중단, 청산은 계속) — /resume 로 재개"
+
+    # ---------------- 메인 ----------------
+    def _notify(self, msg: str) -> None:
+        log.info(msg)
+        if self.tg:
+            self.tg.send(msg)
+
+    def run_once(self) -> dict:
+        self._cycle_no += 1
+        self._refresh_equity()                                 # 감사 F01
+        prices = self.live_prices() if self.use_ws else {}
+        for t in self.cfg.tickers:                             # 없는 종목만 REST 폴백
+            if t in prices:
+                continue
+            if self.client:
+                try:
+                    prices[t] = self.client.get_current_price(t)
+                    continue
+                except Exception:                              # noqa: BLE001
+                    pass
+            px = self._public_price(t)                         # 키 없이도 공개 시세 사용
+            if px:
+                prices[t] = px
+        # 가격을 확보하지 못한 종목은 주문 금지 (스테일/블라인드 트레이딩 방지 — 감사 F10)
+        blocked = {t for t in self.cfg.tickers if t not in prices}
+        cash = None
+        if self.client:
+            try:
+                cash = float(self.client.get_krw_balance())
+            except Exception as e:                             # noqa: BLE001
+                log.warning("원화 잔고 조회 실패: %s", e)
+        result = self.engine.run_cycle(live_prices=prices, cash_krw=cash, blocked_tickers=blocked)
+        if result.get("emergency_stop"):
+            self._notify(f"🚨 비상정지: {result['emergency_stop']} (청산 주문은 계속 실행)")
+        if blocked and self._cycle_no % 10 == 0:
+            self._notify(f"⚠️ 가격 미확보 종목 {len(blocked)}개 — 주문 금지: "
+                         + ", ".join(sorted(x.replace('KRW-', '') for x in blocked)))
+        if len(result["orders"]) >= 8:
+            self._notify(f"⚠️ 사이클 주문 {len(result['orders'])}건 — 한도({self.engine.max_orders_per_cycle}) 근접")
+
+        for order in result["orders"]:
+            ok = self._execute(order)
+            if ok:
+                self.engine.on_order_filled(order, fill_price=prices.get(order["ticker"], order.get("price")))
+                self._notify(f"{'✅' if self.trade else '📝(paper)'} {order['kind']} {order['ticker']} — {order.get('reason', '')}")
+            else:
+                self.engine.rollback_order(order, "주문 실패")
+                if order.get("kind") == "BUY":
+                    result["orders_failed"] = result.get("orders_failed", 0) + 1
+        if result["orders"]:
+            self._notify(f"사이클 {self._cycle_no}: 주문 {len(result['orders'])}건 / "
+                         f"포지션 {len(result['positions'])}종 / 자본 {result['equity_krw']:,.0f}")
+        return result
+
+    def run(self, interval: int = 60) -> None:
+        threads = []
+        if self.use_ws:
+            t = threading.Thread(target=self._ws_loop, name="baekdoocoin-ws", daemon=True)
+            t.start()
+            threads.append(t)
+        t = threading.Thread(target=self._updater_loop, name="baekdoocoin-updater", daemon=True)
+        t.start()
+        threads.append(t)
+
+        self._setup_telegram()
+        log.info("=== 백두코인봇 가동 === %s / %d종 / %d초 사이클 / DB=%s",
+                 "🔴 실거래" if self.trade else "🟡 감시", len(self.cfg.tickers), interval, self.db)
+
+        while not self._stop.is_set():
+            started = time.time()
+            try:
+                self.run_once()
+            except Exception as e:                         # noqa: BLE001
+                log.exception("사이클 오류: %s", e)
+                if self.tg:
+                    self.tg.send(f"⚠️ 사이클 오류: {e}")
+            elapsed = time.time() - started
+            self._stop.wait(max(1.0, interval - elapsed))
+
+    def shutdown(self, *args) -> None:
+        log.warning("종료 신호 — 그레이스풀 셧다운")
+        self.engine.persist()
+        self._stop.set()
+        if self.tg:
+            try:
+                self.tg.send("🛑 백두코인봇 종료 (포지션 상태 저장됨)")
+            except Exception:                              # noqa: BLE001
+                pass
+            self.tg.stop_polling()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="백두코인봇 (Windows) 라이브 모니터")
+    ap.add_argument("--trade", action="store_true", help="실제 주문 실행 (기본=감시만)")
+    ap.add_argument("--once", action="store_true", help="1사이클만 실행 후 종료")
+    ap.add_argument("--no-ws", action="store_true", help="WebSocket 비활성 (DB 종가 사용)")
+    ap.add_argument("--db", default=None)
+    ap.add_argument("--cycle", type=int, default=None, help="사이클 주기(초)")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    setup_logging(args.verbose)
+    cfg = Config.load()
+    if args.db:
+        cfg.db_path = args.db
+    interval = args.cycle or cfg.cycle_seconds
+
+    datastore.init_db(cfg.db_path)
+    if cfg.missing_required() and args.trade:
+        log.error("실거래에는 업비트 API 키가 필요합니다: %s", ", ".join(cfg.missing_required()))
+        return 2
+
+    lock = PidLock(paths.RUNTIME_DIR / "live_monitor.pid")
+    if not lock.acquire():
+        return 3
+    try:
+        mon = LiveMonitor(cfg, trade=args.trade, use_ws=not args.no_ws)
+        signal.signal(signal.SIGINT, mon.shutdown)
+        signal.signal(signal.SIGTERM, mon.shutdown)
+        if args.once:
+            res = mon.run_once()
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+        mon.run(interval)
+        return 0
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
-    import argparse
-    import sys
-    import os
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from config import Config
-
-    parser = argparse.ArgumentParser(description="백두코인봇 라이브 모니터")
-    parser.add_argument("--trade", action="store_true", help="자동매매 활성화")
-    parser.add_argument("--db", default="data/upbit_v2.db", help="DB 경로")
-    args = parser.parse_args()
-
-    # Write PID file for watchdog
-    pidfile = "/tmp/baekdoocoin_live_monitor.pid"
-    with open(pidfile, "w") as f:
-        f.write(str(os.getpid()))
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    )
-
-    cfg = Config.load()
-    monitor = LiveMonitor(cfg, db_path=args.db, trading_enabled=args.trade)
-    monitor.start()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        monitor.stop()
-    finally:
-        # Clean up PID file on exit
-        try:
-            os.remove(pidfile)
-        except OSError:
-            pass
+    raise SystemExit(main())

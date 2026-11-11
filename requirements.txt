@@ -1,0 +1,5 @@
+requests>=2.31
+PyJWT>=2.8
+websocket-client>=1.7
+python-dotenv>=1.0
+numpy>=1.26
